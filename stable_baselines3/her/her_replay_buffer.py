@@ -7,7 +7,7 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.buffers import DictReplayBuffer
-from stable_baselines3.common.type_aliases import DictReplayBufferSamples
+from stable_baselines3.common.type_aliases import DictReplayBufferSamples, TensorDict
 from stable_baselines3.common.vec_env import VecEnv, VecNormalize
 from stable_baselines3.her.goal_selection_strategy import KEY_TO_GOAL_STRATEGY, GoalSelectionStrategy
 
@@ -45,12 +45,10 @@ class HerReplayBuffer(DictReplayBuffer):
         False by default.
     """
 
-    env: Optional[VecEnv]
-
     def __init__(
         self,
         buffer_size: int,
-        observation_space: spaces.Dict,
+        observation_space: spaces.Space,
         action_space: spaces.Space,
         env: VecEnv,
         device: Union[th.device, str] = "auto",
@@ -60,6 +58,7 @@ class HerReplayBuffer(DictReplayBuffer):
         n_sampled_goal: int = 4,
         goal_selection_strategy: Union[GoalSelectionStrategy, str] = "future",
         copy_info_dict: bool = False,
+        online_sampling: Optional[bool] = None,
     ):
         super().__init__(
             buffer_size,
@@ -72,6 +71,14 @@ class HerReplayBuffer(DictReplayBuffer):
         )
         self.env = env
         self.copy_info_dict = copy_info_dict
+
+        if online_sampling is not None:
+            assert online_sampling is True, "Since v1.8.0, SB3 only supports online sampling with HerReplayBuffer."
+            warnings.warn(
+                "Since v1.8.0, the `online_sampling` argument is deprecated "
+                "as SB3 only supports online sampling with HerReplayBuffer. It will be removed in v2.0",
+                stacklevel=1,
+            )
 
         # convert goal_selection_strategy into GoalSelectionStrategy if string
         if isinstance(goal_selection_strategy, str):
@@ -132,10 +139,10 @@ class HerReplayBuffer(DictReplayBuffer):
 
         self.env = env
 
-    def add(  # type: ignore[override]
+    def add(
         self,
-        obs: Dict[str, np.ndarray],
-        next_obs: Dict[str, np.ndarray],
+        obs: TensorDict,
+        next_obs: TensorDict,
         action: np.ndarray,
         reward: np.ndarray,
         done: np.ndarray,
@@ -164,26 +171,18 @@ class HerReplayBuffer(DictReplayBuffer):
         # When episode ends, compute and store the episode length
         for env_idx in range(self.n_envs):
             if done[env_idx]:
-                self._compute_episode_length(env_idx)
+                episode_start = self._current_ep_start[env_idx]
+                episode_end = self.pos
+                if episode_end < episode_start:
+                    # Occurs when the buffer becomes full, the storage resumes at the
+                    # beginning of the buffer. This can happen in the middle of an episode.
+                    episode_end += self.buffer_size
+                episode_indices = np.arange(episode_start, episode_end) % self.buffer_size
+                self.ep_length[episode_indices, env_idx] = episode_end - episode_start
+                # Update the current episode start
+                self._current_ep_start[env_idx] = self.pos
 
-    def _compute_episode_length(self, env_idx: int) -> None:
-        """
-        Compute and store the episode length for environment with index env_idx
-
-        :param env_idx: index of the environment for which the episode length should be computed
-        """
-        episode_start = self._current_ep_start[env_idx]
-        episode_end = self.pos
-        if episode_end < episode_start:
-            # Occurs when the buffer becomes full, the storage resumes at the
-            # beginning of the buffer. This can happen in the middle of an episode.
-            episode_end += self.buffer_size
-        episode_indices = np.arange(episode_start, episode_end) % self.buffer_size
-        self.ep_length[episode_indices, env_idx] = episode_end - episode_start
-        # Update the current episode start
-        self._current_ep_start[env_idx] = self.pos
-
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> DictReplayBufferSamples:  # type: ignore[override]
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> DictReplayBufferSamples:
         """
         Sample elements from the replay buffer.
 
@@ -255,7 +254,7 @@ class HerReplayBuffer(DictReplayBuffer):
         Get the samples corresponding to the batch and environment indices.
 
         :param batch_indices: Indices of the transitions
-        :param env_indices: Indices of the environments
+        :param env_indices: Indices of the envrionments
         :param env: associated gym VecEnv to normalize the
             observations/rewards when sampling, defaults to None
         :return: Samples
@@ -266,8 +265,6 @@ class HerReplayBuffer(DictReplayBuffer):
             {key: obs[batch_indices, env_indices, :] for key, obs in self.next_observations.items()}, env
         )
 
-        assert isinstance(obs_, dict)
-        assert isinstance(next_obs_, dict)
         # Convert to torch tensor
         observations = {key: self.to_torch(obs) for key, obs in obs_.items()}
         next_observations = {key: self.to_torch(obs) for key, obs in next_obs_.items()}
@@ -294,7 +291,7 @@ class HerReplayBuffer(DictReplayBuffer):
         Get the samples, sample new desired goals and compute new rewards.
 
         :param batch_indices: Indices of the transitions
-        :param env_indices: Indices of the environments
+        :param env_indices: Indices of the envrionments
         :param env: associated gym VecEnv to normalize the
             observations/rewards when sampling, defaults to None
         :return: Samples, with new desired goals and new rewards
@@ -313,12 +310,11 @@ class HerReplayBuffer(DictReplayBuffer):
         # The desired goal for the next observation must be the same as the previous one
         next_obs["desired_goal"] = new_goals
 
-        assert (
-            self.env is not None
-        ), "You must initialize HerReplayBuffer with a VecEnv so it can compute rewards for virtual transitions"
         # Compute new reward
         rewards = self.env.env_method(
             "compute_reward",
+            # here we use the new desired goal
+            obs["desired_goal"],
             # the new state depends on the previous state and action
             # s_{t+1} = f(s_t, a_t)
             # so the next achieved_goal depends also on the previous state and action
@@ -326,15 +322,13 @@ class HerReplayBuffer(DictReplayBuffer):
             # r_t = reward(s_t, a_t) = reward(next_achieved_goal, desired_goal)
             # therefore we have to use next_obs["achieved_goal"] and not obs["achieved_goal"]
             next_obs["achieved_goal"],
-            # here we use the new desired goal
-            obs["desired_goal"],
             infos,
             # we use the method of the first environment assuming that all environments are identical.
             indices=[0],
         )
         rewards = rewards[0].astype(np.float32)  # env_method returns a list containing one element
-        obs = self._normalize_obs(obs, env)  # type: ignore[assignment]
-        next_obs = self._normalize_obs(next_obs, env)  # type: ignore[assignment]
+        obs = self._normalize_obs(obs, env)
+        next_obs = self._normalize_obs(next_obs, env)
 
         # Convert to torch tensor
         observations = {key: self.to_torch(obs) for key, obs in obs.items()}
@@ -349,7 +343,7 @@ class HerReplayBuffer(DictReplayBuffer):
             dones=self.to_torch(
                 self.dones[batch_indices, env_indices] * (1 - self.timeouts[batch_indices, env_indices])
             ).reshape(-1, 1),
-            rewards=self.to_torch(self._normalize_reward(rewards.reshape(-1, 1), env)),  # type: ignore[attr-defined]
+            rewards=self.to_torch(self._normalize_reward(rewards.reshape(-1, 1), env)),
         )
 
     def _sample_goals(self, batch_indices: np.ndarray, env_indices: np.ndarray) -> np.ndarray:
@@ -357,7 +351,7 @@ class HerReplayBuffer(DictReplayBuffer):
         Sample goals based on goal_selection_strategy.
 
         :param batch_indices: Indices of the transitions
-        :param env_indices: Indices of the environments
+        :param env_indices: Indices of the envrionments
         :return: Sampled goals
         """
         batch_ep_start = self.ep_start[batch_indices, env_indices]
@@ -390,19 +384,12 @@ class HerReplayBuffer(DictReplayBuffer):
         If not called, we assume that we continue the same trajectory (same episode).
         """
         # If we are at the start of an episode, no need to truncate
-        if (self._current_ep_start != self.pos).any():
+        if (self.ep_start[self.pos] != self.pos).any():
             warnings.warn(
                 "The last trajectory in the replay buffer will be truncated.\n"
                 "If you are in the same episode as when the replay buffer was saved,\n"
                 "you should use `truncate_last_trajectory=False` to avoid that issue."
             )
-            # only consider epsiodes that are not finished
-            for env_idx in np.where(self._current_ep_start != self.pos)[0]:
-                # set done = True for last episodes
-                self.dones[self.pos - 1, env_idx] = True
-                # make sure that last episodes can be sampled and
-                # update next episode start (self._current_ep_start)
-                self._compute_episode_length(env_idx)
-                # handle infinite horizon tasks
-                if self.handle_timeout_termination:
-                    self.timeouts[self.pos - 1, env_idx] = True  # not an actual timeout, but it allows bootstrapping
+            self.ep_start[-1] = self.pos
+            # set done = True for current episodes
+            self.dones[self.pos - 1] = True

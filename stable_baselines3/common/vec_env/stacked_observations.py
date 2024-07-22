@@ -9,6 +9,9 @@ from stable_baselines3.common.preprocessing import is_image_space, is_image_spac
 TObs = TypeVar("TObs", np.ndarray, Dict[str, np.ndarray])
 
 
+# Disable errors for pytype which doesn't play well with Generic[TypeVar]
+# mypy check passes though
+# pytype: disable=attribute-error
 class StackedObservations(Generic[TObs]):
     """
     Frame stacking wrapper for data.
@@ -28,7 +31,7 @@ class StackedObservations(Generic[TObs]):
         self,
         num_envs: int,
         n_stack: int,
-        observation_space: Union[spaces.Box, spaces.Dict],
+        observation_space: Union[spaces.Box, spaces.Dict],  # Replace by Space[TObs] in gym>=0.26
         channels_order: Optional[Union[str, Mapping[str, Optional[str]]]] = None,
     ) -> None:
         self.n_stack = n_stack
@@ -97,6 +100,36 @@ class StackedObservations(Generic[TObs]):
         stacked_shape = list(observation_space.shape)
         stacked_shape[repeat_axis] *= n_stack
         return channels_first, stack_dimension, tuple(stacked_shape), repeat_axis
+
+    def stack_observation_space(self, observation_space: Union[spaces.Box, spaces.Dict]) -> Union[spaces.Box, spaces.Dict]:
+        """
+        This function is deprecated.
+
+        As an alternative, use
+
+        .. code-block:: python
+
+            low = np.repeat(observation_space.low, stacked_observation.n_stack, axis=stacked_observation.repeat_axis)
+            high = np.repeat(observation_space.high, stacked_observation.n_stack, axis=stacked_observation.repeat_axis)
+            stacked_observation_space = spaces.Box(low=low, high=high, dtype=observation_space.dtype)
+
+        :return: New observation space with stacked dimensions
+        """
+        warnings.warn(
+            "stack_observation_space is deprecated and will be removed in the next SB3 release. "
+            "Please refer to the docstring for a workaround.",
+            DeprecationWarning,
+        )
+        if isinstance(observation_space, spaces.Dict):
+            return spaces.Dict(
+                {
+                    key: sub_stacked_observation.stack_observation_space(sub_stacked_observation.observation_space)
+                    for key, sub_stacked_observation in self.sub_stacked_observations.items()
+                }
+            )
+        low = np.repeat(observation_space.low, self.n_stack, axis=self.repeat_axis)
+        high = np.repeat(observation_space.high, self.n_stack, axis=self.repeat_axis)
+        return spaces.Box(low=low, high=high, dtype=observation_space.dtype)  # type: ignore[arg-type]
 
     def reset(self, observation: TObs) -> TObs:
         """

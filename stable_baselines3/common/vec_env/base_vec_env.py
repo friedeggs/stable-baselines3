@@ -1,7 +1,6 @@
 import inspect
 import warnings
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, Union
 
 import cloudpickle
@@ -20,17 +19,17 @@ VecEnvObs = Union[np.ndarray, Dict[str, np.ndarray], Tuple[np.ndarray, ...]]
 VecEnvStepReturn = Tuple[VecEnvObs, np.ndarray, np.ndarray, List[Dict]]
 
 
-def tile_images(images_nhwc: Sequence[np.ndarray]) -> np.ndarray:  # pragma: no cover
+def tile_images(img_nhwc: Sequence[np.ndarray]) -> np.ndarray:  # pragma: no cover
     """
     Tile N images into one big PxQ image
     (P,Q) are chosen to be as close as possible, and if N
     is square, then P=Q.
 
-    :param images_nhwc: list or array of images, ndim=4 once turned into array.
+    :param img_nhwc: list or array of images, ndim=4 once turned into array. img nhwc
         n = batch index, h = height, w = width, c = channel
     :return: img_HWc, ndim=3
     """
-    img_nhwc = np.asarray(images_nhwc)
+    img_nhwc = np.asarray(img_nhwc)
     n_images, height, width, n_channels = img_nhwc.shape
     # new_height was named H before
     new_height = int(np.ceil(np.sqrt(n_images)))
@@ -55,54 +54,20 @@ class VecEnv(ABC):
     :param action_space: Action space
     """
 
+    metadata = {"render_modes": ["human", "rgb_array"]}
+
     def __init__(
         self,
         num_envs: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
+        render_mode: Optional[str] = None,
     ):
         self.num_envs = num_envs
         self.observation_space = observation_space
         self.action_space = action_space
-        # store info returned by the reset method
-        self.reset_infos: List[Dict[str, Any]] = [{} for _ in range(num_envs)]
-        # seeds to be used in the next call to env.reset()
-        self._seeds: List[Optional[int]] = [None for _ in range(num_envs)]
-        # options to be used in the next call to env.reset()
-        self._options: List[Dict[str, Any]] = [{} for _ in range(num_envs)]
-
-        try:
-            render_modes = self.get_attr("render_mode")
-        except AttributeError:
-            warnings.warn("The `render_mode` attribute is not defined in your environment. It will be set to None.")
-            render_modes = [None for _ in range(num_envs)]
-
-        assert all(
-            render_mode == render_modes[0] for render_mode in render_modes
-        ), "render_mode mode should be the same for all environments"
-        self.render_mode = render_modes[0]
-
-        render_modes = []
-        if self.render_mode is not None:
-            if self.render_mode == "rgb_array":
-                # SB3 uses OpenCV for the "human" mode
-                render_modes = ["human", "rgb_array"]
-            else:
-                render_modes = [self.render_mode]
-
-        self.metadata = {"render_modes": render_modes}
-
-    def _reset_seeds(self) -> None:
-        """
-        Reset the seeds that are going to be used at the next reset.
-        """
-        self._seeds = [None for _ in range(self.num_envs)]
-
-    def _reset_options(self) -> None:
-        """
-        Reset the options that are going to be used at the next reset.
-        """
-        self._options = [{} for _ in range(self.num_envs)]
+        self.render_mode = render_mode
+        self.reset_infos = [{} for _ in range(num_envs)]  # store info returned by the reset method
 
     @abstractmethod
     def reset(self) -> VecEnvObs:
@@ -227,7 +192,7 @@ class VecEnv(ABC):
                     "but the render mode defined when initializing the environment must be "
                     f"'human' or 'rgb_array', not '{self.render_mode}'."
                 )
-                return None
+                return
 
         elif mode and self.render_mode != mode:
             warnings.warn(
@@ -235,30 +200,30 @@ class VecEnv(ABC):
                 We allow to pass a mode argument to maintain a backwards compatible VecEnv API, but the mode ({mode})
                 has to be the same as the environment render mode ({self.render_mode}) which is not the case."""
             )
-            return None
+            return
 
         mode = mode or self.render_mode
 
         if mode is None:
             warnings.warn("You tried to call render() but no `render_mode` was passed to the env constructor.")
-            return None
+            return
 
         # mode == self.render_mode == "human"
         # In that case, we try to call `self.env.render()` but it might
         # crash for subprocesses
         if self.render_mode == "human":
             self.env_method("render")
-            return None
+            return
 
         if mode == "rgb_array" or mode == "human":
             # call the render method of the environments
             images = self.get_images()
             # Create a big image by tiling images from subprocesses
-            bigimg = tile_images(images)  # type: ignore[arg-type]
+            bigimg = tile_images(images)
 
             if mode == "human":
                 # Display it using OpenCV
-                import cv2
+                import cv2  # pytype:disable=import-error
 
                 cv2.imshow("vecenv", bigimg[:, :, ::-1])
                 cv2.waitKey(1)
@@ -271,42 +236,18 @@ class VecEnv(ABC):
             # crash for subprocesses
             # and we don't return the values
             self.env_method("render")
-        return None
 
-    def seed(self, seed: Optional[int] = None) -> Sequence[Union[None, int]]:
+    @abstractmethod
+    def seed(self, seed: Optional[int] = None) -> List[Union[None, int]]:
         """
         Sets the random seeds for all environments, based on a given seed.
         Each individual environment will still get its own seed, by incrementing the given seed.
-        WARNING: since gym 0.26, those seeds will only be passed to the environment
-        at the next reset.
 
         :param seed: The random seed. May be None for completely random seeding.
         :return: Returns a list containing the seeds for each individual env.
             Note that all list elements may be None, if the env does not return anything when being seeded.
         """
-        if seed is None:
-            # To ensure that subprocesses have different seeds,
-            # we still populate the seed variable when no argument is passed
-            seed = int(np.random.randint(0, np.iinfo(np.uint32).max, dtype=np.uint32))
-
-        self._seeds = [seed + idx for idx in range(self.num_envs)]
-        return self._seeds
-
-    def set_options(self, options: Optional[Union[List[Dict], Dict]] = None) -> None:
-        """
-        Set environment options for all environments.
-        If a dict is passed instead of a list, the same options will be used for all environments.
-        WARNING: Those options will only be passed to the environment at the next reset.
-
-        :param options: A dictionary of environment options to pass to each environment at the next reset.
-        """
-        if options is None:
-            options = {}
-        # Use deepcopy to avoid side effects
-        if isinstance(options, dict):
-            self._options = deepcopy([options] * self.num_envs)
-        else:
-            self._options = deepcopy(options)
+        pass
 
     @property
     def unwrapped(self) -> "VecEnv":
@@ -355,13 +296,15 @@ class VecEnvWrapper(VecEnv):
         venv: VecEnv,
         observation_space: Optional[spaces.Space] = None,
         action_space: Optional[spaces.Space] = None,
+        render_mode: Optional[str] = None,
     ):
         self.venv = venv
-
-        super().__init__(
+        VecEnv.__init__(
+            self,
             num_envs=venv.num_envs,
             observation_space=observation_space or venv.observation_space,
             action_space=action_space or venv.action_space,
+            render_mode=render_mode,
         )
         self.class_attributes = dict(inspect.getmembers(self.__class__))
 
@@ -376,11 +319,8 @@ class VecEnvWrapper(VecEnv):
     def step_wait(self) -> VecEnvStepReturn:
         pass
 
-    def seed(self, seed: Optional[int] = None) -> Sequence[Union[None, int]]:
+    def seed(self, seed: Optional[int] = None) -> List[Union[None, int]]:
         return self.venv.seed(seed)
-
-    def set_options(self, options: Optional[Union[List[Dict], Dict]] = None) -> None:
-        return self.venv.set_options(options)
 
     def close(self) -> None:
         return self.venv.close()
@@ -446,7 +386,7 @@ class VecEnvWrapper(VecEnv):
 
         return attr
 
-    def getattr_depth_check(self, name: str, already_found: bool) -> Optional[str]:
+    def getattr_depth_check(self, name: str, already_found: bool) -> str:
         """See base class.
 
         :return: name of module whose attribute is being shadowed, if any.
@@ -454,7 +394,7 @@ class VecEnvWrapper(VecEnv):
         all_attributes = self._get_all_attributes()
         if name in all_attributes and already_found:
             # this venv's attribute is being hidden because of a higher venv.
-            shadowed_wrapper_class: Optional[str] = f"{type(self).__module__}.{type(self).__name__}"
+            shadowed_wrapper_class = f"{type(self).__module__}.{type(self).__name__}"
         elif name in all_attributes and not already_found:
             # we have found the first reference to the attribute. Now check for duplicates.
             shadowed_wrapper_class = self.venv.getattr_depth_check(name, True)

@@ -91,7 +91,8 @@ def evaluate_policy(
             episode_start=episode_starts,
             deterministic=deterministic,
         )
-        new_observations, rewards, dones, infos = env.step(actions)
+        observations, rewards, dones, infos = env.step(actions)
+        # print(observations[...,0], actions)
         current_rewards += rewards
         current_lengths += 1
         for i in range(n_envs):
@@ -124,8 +125,6 @@ def evaluate_policy(
                         episode_counts[i] += 1
                     current_rewards[i] = 0
                     current_lengths[i] = 0
-
-        observations = new_observations
 
         if render:
             env.render()
